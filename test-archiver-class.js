@@ -11,3 +11,4 @@ output.on('close', () => { console.log('closed', archive.pointer()); });
 archive.pipe(output);
 archive.directory(frontendPath, false);
 archive.finalize();
+

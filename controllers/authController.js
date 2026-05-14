@@ -64,9 +64,20 @@ exports.register = async (req, res) => {
             });
         }
 
+        const token = jwt.sign(
+            {
+                id: data.id,
+                email: data.email,
+                name: data.name
+            },
+            SECRET,
+            { expiresIn: "7d" }
+        );
+
         res.status(201).json({
             success: true,
             message: "Compte créé avec succès",
+            token,
             user: {
                 id: data.id,
                 name: data.name,

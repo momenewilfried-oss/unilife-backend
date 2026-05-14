@@ -2,69 +2,45 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const archiver = require("archiver");
-const fs = require("fs");
 require("dotenv").config();
 const PDFDocument = require("pdfkit");
 
 const app = express();
 
 const frontendPath = path.resolve(__dirname, "../unilife-front-end");
-
-console.log("📁 Frontend path resolved:", frontendPath);
-console.log("📁 Directory exists?", fs.existsSync(frontendPath));
-
-// ====================== DOWNLOAD APP ROUTE ======================
-app.get("/app/download", (req, res) => {
-    try {
-        if (!fs.existsSync(frontendPath)) {
-            console.error("❌ Frontend folder not found at:", frontendPath);
-            return res.status(404).send("Dossier de l'application frontend non trouvé.");
-        }
-
-        res.setHeader("Content-Type", "application/zip");
-        res.setHeader("Content-Disposition", "attachment; filename=unilife-app.zip");
-
-        const archive = archiver('zip', {
-            zlib: { level: 9 }
-        });
-
-        archive.on("error", (err) => {
-            console.error("❌ Archive error:", err);
-            if (!res.headersSent) {
-                res.status(500).send("Erreur lors de la création du fichier ZIP");
-            }
-        });
-
-        archive.on("warning", (warning) => {
-            console.warn("⚠️ Archive warning:", warning);
-        });
-
-        // Pipe AVANT d'ajouter les fichiers
-        archive.pipe(res);
-
-        console.log("📦 Starting ZIP creation...");
-        archive.directory(frontendPath, false);
-        
-        archive.finalize()
-            .then(() => console.log("✅ ZIP finalized successfully"))
-            .catch(err => console.error("❌ Finalize error:", err));
-
-    } catch (err) {
-        console.error("💥 Server error in /app/download:", err);
-        if (!res.headersSent) {
-            res.status(500).send("Erreur serveur lors de la génération du ZIP.");
-        }
-    }
-});
-
-// ====================== STATIC FILES ======================
 app.use("/app", express.static(frontendPath));
 
-// ====================== MIDDLEWARES ======================
+app.get("/app/download", (req, res) => {
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", "attachment; filename=unilife-app.zip");
+
+    const archive = new archiver.ZipArchive({
+        zlib: { level: 9 }
+    });
+
+    archive.on("error", (err) => {
+        console.error("Archive error:", err);
+        if (!res.headersSent) {
+            res.status(500).send({ success: false, message: "Erreur de génération du téléchargement" });
+        } else {
+            res.end();
+        }
+    });
+
+    archive.pipe(res);
+    archive.directory(frontendPath, false);
+    archive.finalize();
+});
+
+/* =========================
+   MIDDLEWARES
+========================= */
 app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json());
 
-// ====================== SUPABASE ======================
+/* =========================
+   SUPABASE
+========================= */
 const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(
@@ -72,18 +48,24 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ====================== AUTH ======================
+/* =========================
+   AUTH
+========================= */
 const authRoutes = require("./routes/auth");
 const authMiddleware = require("./middleware/authMiddleware");
 
 app.use("/api/auth", authRoutes);
 
-// ====================== HEALTH ======================
+/* =========================
+   HEALTH
+========================= */
 app.get("/", (req, res) => {
     res.json({ success: true, message: "UNILIFE ONLINE 🚀" });
 });
 
-// ====================== GET OR CREATE CLASS ======================
+/* =========================
+   GET OR CREATE CLASS
+========================= */
 async function getOrCreateClass(className, userId) {
     const name = className.trim().toUpperCase();
 
@@ -107,7 +89,9 @@ async function getOrCreateClass(className, userId) {
     return created.id;
 }
 
-// ====================== SAVE BULLETIN ======================
+/* =========================
+   SAVE BULLETIN
+========================= */
 app.post("/save", authMiddleware, async (req, res) => {
     try {
         const { class_name, student_name, moyenne, mention, total_coef, subjects } = req.body;
@@ -132,6 +116,7 @@ app.post("/save", authMiddleware, async (req, res) => {
 
         const studentId = student.id;
 
+        // ⚠️ IMPORTANT: pas de user_id ici
         const subjectRows = subjects.map(s => ({
             student_id: studentId,
             nom_matiere: s.nom_matiere,
@@ -149,11 +134,13 @@ app.post("/save", authMiddleware, async (req, res) => {
 
     } catch (err) {
         console.error(err);
-        res.status(500).json({ success: false, message: err.message });
+        res.status(500).json({ success: false });
     }
 });
 
-// ====================== LIST STUDENTS ======================
+/* =========================
+   LIST STUDENTS (SECURE)
+========================= */
 app.get("/students", authMiddleware, async (req, res) => {
     const userId = req.user.id;
 
@@ -167,7 +154,23 @@ app.get("/students", authMiddleware, async (req, res) => {
     res.json(data);
 });
 
-// ====================== PDF ROUTE ======================
+/* =========================
+   SECURITY CHECK FUNCTION
+========================= */
+async function checkStudentOwner(studentId, userId) {
+    const { data } = await supabase
+        .from("students")
+        .select("id")
+        .eq("id", studentId)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+    return !!data;
+}
+
+/* =========================
+   PDF SECURE ROUTE
+========================= */
 app.get("/student/:id/pdf", authMiddleware, async (req, res) => {
     try {
         const studentId = req.params.id;
@@ -199,7 +202,7 @@ app.get("/student/:id/pdf", authMiddleware, async (req, res) => {
         const doc = new PDFDocument({ size: "A4", margins: { top: 50, left: 50, right: 50, bottom: 50 } });
 
         res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `attachment; filename=bulletin-${student.nom.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`);
+        res.setHeader("Content-Disposition", `attachment; filename=bulletin-${student.nom}.pdf`);
 
         doc.pipe(res);
 
@@ -291,9 +294,8 @@ app.get("/student/:id/pdf", authMiddleware, async (req, res) => {
     }
 });
 
-// ====================== START SERVER ======================
+/* =========================
+   START
+========================= */
 const PORT = process.env.PORT || 3002;
-app.listen(PORT, () => {
-    console.log(`🚀 UNILIFE Backend running on http://localhost:${PORT}`);
-    console.log(`📱 Accès à l'application : http://localhost:${PORT}/app/`);
-});
+app.listen(PORT, () => console.log("RUNNING ON", PORT));
