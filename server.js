@@ -1,113 +1,121 @@
 const express = require("express");
 const cors = require("cors");
-const { createClient } = require("@supabase/supabase-js");
+const path = require("path");
+const archiver = require("archiver");
+const fs = require("fs");
 require("dotenv").config();
+const PDFDocument = require("pdfkit");
 
 const app = express();
 
-/* =========================
-   MIDDLEWARES
-========================= */
-app.use(cors({
-    origin: "*",
-    credentials: true
-}));
+const frontendPath = path.resolve(__dirname, "../unilife-front-end");
 
+console.log("📁 Frontend path resolved:", frontendPath);
+console.log("📁 Directory exists?", fs.existsSync(frontendPath));
+
+// ====================== DOWNLOAD APP ROUTE ======================
+app.get("/app/download", (req, res) => {
+    try {
+        if (!fs.existsSync(frontendPath)) {
+            console.error("❌ Frontend folder not found at:", frontendPath);
+            return res.status(404).send("Dossier de l'application frontend non trouvé.");
+        }
+
+        res.setHeader("Content-Type", "application/zip");
+        res.setHeader("Content-Disposition", "attachment; filename=unilife-app.zip");
+
+        const archive = archiver('zip', {
+            zlib: { level: 9 }
+        });
+
+        archive.on("error", (err) => {
+            console.error("❌ Archive error:", err);
+            if (!res.headersSent) {
+                res.status(500).send("Erreur lors de la création du fichier ZIP");
+            }
+        });
+
+        archive.on("warning", (warning) => {
+            console.warn("⚠️ Archive warning:", warning);
+        });
+
+        // Pipe AVANT d'ajouter les fichiers
+        archive.pipe(res);
+
+        console.log("📦 Starting ZIP creation...");
+        archive.directory(frontendPath, false);
+        
+        archive.finalize()
+            .then(() => console.log("✅ ZIP finalized successfully"))
+            .catch(err => console.error("❌ Finalize error:", err));
+
+    } catch (err) {
+        console.error("💥 Server error in /app/download:", err);
+        if (!res.headersSent) {
+            res.status(500).send("Erreur serveur lors de la génération du ZIP.");
+        }
+    }
+});
+
+// ====================== STATIC FILES ======================
+app.use("/app", express.static(frontendPath));
+
+// ====================== MIDDLEWARES ======================
+app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json());
 
-const authMiddleware = require("./middleware/authMiddleware");
+// ====================== SUPABASE ======================
+const { createClient } = require("@supabase/supabase-js");
 
-/* =========================
-   SUPABASE
-========================= */
 const supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_KEY
+    process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* =========================
-   HELPER : Récupérer user_id
-========================= */
-const getUserId = (req) => {
-    return req.user?.id || req.user?.user_id;
-};
-
-/* =========================
-   ROUTES
-========================= */
+// ====================== AUTH ======================
 const authRoutes = require("./routes/auth");
+const authMiddleware = require("./middleware/authMiddleware");
+
 app.use("/api/auth", authRoutes);
 
-/* =========================
-   ROUTES PUBLIQUES
-========================= */
+// ====================== HEALTH ======================
 app.get("/", (req, res) => {
-    res.status(200).json({ success: true, message: "UNILIFE BACKEND ONLINE 🚀" });
+    res.json({ success: true, message: "UNILIFE ONLINE 🚀" });
 });
 
-app.get("/health", (req, res) => {
-    res.status(200).json({ status: "ok" });
-});
-
-/* =========================
-   GET OR CREATE CLASS (Insensible à la casse)
-========================= */
+// ====================== GET OR CREATE CLASS ======================
 async function getOrCreateClass(className, userId) {
-    if (!className || !userId) throw new Error("Classe et User ID requis");
+    const name = className.trim().toUpperCase();
 
-    const normalizedName = className.trim().toLowerCase();
-
-    // Recherche insensible à la casse
-    const { data: existingClass } = await supabase
+    const { data } = await supabase
         .from("classes")
-        .select("id")
+        .select("*")
+        .eq("name", name)
         .eq("user_id", userId)
-        .eq("name", normalizedName)
         .maybeSingle();
 
-    if (existingClass) {
-        return existingClass.id;
-    }
+    if (data) return data.id;
 
-    // Création de la classe en minuscule
-    const { data, error } = await supabase
+    const { data: created, error } = await supabase
         .from("classes")
-        .insert([{ 
-            name: normalizedName, 
-            user_id: userId 
-        }])
-        .select("id");
+        .insert([{ name, user_id: userId }])
+        .select()
+        .single();
 
     if (error) throw error;
-    return data[0].id;
+
+    return created.id;
 }
 
-/* =========================
-   SAVE STUDENT + SUBJECTS
-========================= */
+// ====================== SAVE BULLETIN ======================
 app.post("/save", authMiddleware, async (req, res) => {
     try {
         const { class_name, student_name, moyenne, mention, total_coef, subjects } = req.body;
-        const userId = getUserId(req);
-
-        if (!userId) {
-            return res.status(401).json({
-                success: false,
-                message: "Authentification requise"
-            });
-        }
-
-        if (!class_name || !student_name) {
-            return res.status(400).json({
-                success: false,
-                message: "Classe et nom de l'étudiant requis"
-            });
-        }
+        const userId = req.user.id;
 
         const classId = await getOrCreateClass(class_name, userId);
 
-        // Enregistrer l'étudiant
-        const { data: studentData, error: studentError } = await supabase
+        const { data: student, error } = await supabase
             .from("students")
             .insert([{
                 nom: student_name,
@@ -117,119 +125,175 @@ app.post("/save", authMiddleware, async (req, res) => {
                 class_id: classId,
                 user_id: userId
             }])
-            .select("id");
+            .select("id")
+            .single();
 
-        if (studentError) throw studentError;
+        if (error) throw error;
 
-        const studentId = studentData[0].id;
+        const studentId = student.id;
 
-        // Enregistrer les matières
-        const subjectsToInsert = subjects.map(subject => ({
-            nom_matiere: subject.nom_matiere,
-            note: subject.note,
-            coef: subject.coef,
+        const subjectRows = subjects.map(s => ({
             student_id: studentId,
-            class_id: classId,
-            user_id: userId
+            nom_matiere: s.nom_matiere,
+            note: s.note,
+            coef: s.coef
         }));
 
-        const { error: subjectError } = await supabase
+        const { error: subErr } = await supabase
             .from("subjects")
-            .insert(subjectsToInsert);
+            .insert(subjectRows);
 
-        if (subjectError) throw subjectError;
+        if (subErr) throw subErr;
 
-        res.json({
-            success: true,
-            message: "Bulletin enregistré avec succès ✓"
-        });
+        res.json({ success: true, studentId });
 
     } catch (err) {
         console.error(err);
-        res.status(500).json({
-            success: false,
-            message: "Erreur serveur"
-        });
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
-/* =========================
-   GET STUDENTS
-========================= */
+// ====================== LIST STUDENTS ======================
 app.get("/students", authMiddleware, async (req, res) => {
-    try {
-        const userId = getUserId(req);
+    const userId = req.user.id;
 
-        const { data, error } = await supabase
-            .from("students")
-            .select(`
-                *,
-                classes(name)
-            `)
-            .eq("user_id", userId)
-            .order("id", { ascending: false });
+    const { data, error } = await supabase
+        .from("students")
+        .select("*")
+        .eq("user_id", userId);
 
-        if (error) throw error;
+    if (error) return res.status(500).json({ error });
 
-        res.json(data);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, message: "Erreur serveur" });
-    }
+    res.json(data);
 });
 
-/* =========================
-   GET SUBJECTS
-========================= */
-app.get("/student/:id/subjects", authMiddleware, async (req, res) => {
+// ====================== PDF ROUTE ======================
+app.get("/student/:id/pdf", authMiddleware, async (req, res) => {
     try {
-        const userId = getUserId(req);
+        const studentId = req.params.id;
+        const userId = req.user.id;
 
-        const { data, error } = await supabase
+        const { data: student, error: studentError } = await supabase
+            .from("students")
+            .select(`*, classes(name)`)
+            .eq("id", studentId)
+            .eq("user_id", userId)
+            .maybeSingle();
+
+        if (!student || studentError) {
+            return res.status(403).json({ success: false, message: "Accès refusé" });
+        }
+
+        const { data: subjects } = await supabase
             .from("subjects")
             .select("*")
-            .eq("student_id", req.params.id)
-            .eq("user_id", userId);
+            .eq("student_id", studentId);
 
-        if (error) throw error;
+        const totalCoef = subjects.reduce((sum, subject) => sum + (Number(subject.coef) || 0), 0);
+        const average = student.moyenne ?? 0;
+        const mention = student.mention ?? "N/A";
+        const year = new Date().getFullYear();
+        const academicYear = `${year - 1}/${year}`;
+        const institutionName = req.user.name || "UNILIFE UNIVERSITY";
 
-        res.json(data);
+        const doc = new PDFDocument({ size: "A4", margins: { top: 50, left: 50, right: 50, bottom: 50 } });
+
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename=bulletin-${student.nom.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`);
+
+        doc.pipe(res);
+
+        const brandBlue = "#2563eb";
+        const nightBlue = "#1e293b";
+        const lightGrey = "#f8fafc";
+        const softGrey = "#e2e8f0";
+        const textDark = "#0f172a";
+        const accentGreen = "#16a34a";
+        const accentOrange = "#f59e0b";
+        const accentRed = "#dc2626";
+        const accentBlue = "#3b82f6";
+
+        // Header premium
+        doc.rect(50, 50, doc.page.width - 100, 140).fill(nightBlue);
+        doc.fillColor("white").font("Helvetica-Bold").fontSize(22).text(institutionName.toUpperCase(), 60, 68, { align: "left" });
+        doc.font("Helvetica").fontSize(10).fillColor("#cbd5e1").text("etablissement d'enseignement secondaire | Bulletin officiel ", 60, 98, { width: 320, lineGap: 2 });
+        doc.fillColor(brandBlue).rect(60, 128, 140, 6).fill();
+        doc.font("Helvetica-Bold").fontSize(14).fillColor("white").text("BULLETIN DE NOTES", 60, 142);
+
+        doc.font("Helvetica").fontSize(10).fillColor("#cbd5e1").text(`Date : ${new Date().toLocaleDateString("fr-FR")}`, doc.page.width - 200, 72, { width: 140, align: "right" });
+        doc.text(`Année académique : ${academicYear}`, { width: 140, align: "right" });
+
+        // Fiche étudiant
+        const cardTop = 210;
+        const cardHeight = 130;
+        doc.roundedRect(50, cardTop, doc.page.width - 100, cardHeight, 12).fill(lightGrey).stroke();
+        doc.fillColor(textDark).font("Helvetica-Bold").fontSize(12).text("Fiche étudiant", 64, cardTop + 18);
+        doc.font("Helvetica").fontSize(10).fillColor(nightBlue);
+        doc.text(`Nom : ${student.nom}`, 64, cardTop + 42);
+        doc.text(`Identifiant : ${student.id}`, 64, cardTop + 58);
+        doc.text(`Classe : ${student.classes?.name ?? "Non renseignée"}`, 64, cardTop + 74);
+
+        doc.text(`Moyenne générale : ${average.toFixed(2)}`, doc.page.width / 2 + 10, cardTop + 42, { width: 200, align: "left" });
+        doc.text(`Mention : ${mention}`, doc.page.width / 2 + 10, cardTop + 58, { width: 200, align: "left" });
+        doc.text(`Total des coefficients : ${totalCoef}`, doc.page.width / 2 + 10, cardTop + 74, { width: 200, align: "left" });
+
+        // Tableau de matières
+        const tableTop = cardTop + cardHeight + 30;
+        const tableLeft = 50;
+        const tableWidth = doc.page.width - 100;
+        const rowHeight = 22;
+        const colWidths = [tableWidth * 0.45, tableWidth * 0.17, tableWidth * 0.17, tableWidth * 0.21];
+
+        doc.fillColor(nightBlue).rect(tableLeft, tableTop, tableWidth, 28).fill();
+        doc.fillColor("white").font("Helvetica-Bold").fontSize(11);
+        doc.text("Matière", tableLeft + 12, tableTop + 8, { width: colWidths[0] });
+        doc.text("Note", tableLeft + colWidths[0] + 12, tableTop + 8, { width: colWidths[1] });
+        doc.text("Coefficient", tableLeft + colWidths[0] + colWidths[1] + 12, tableTop + 8, { width: colWidths[2] });
+        doc.text("Observation", tableLeft + colWidths[0] + colWidths[1] + colWidths[2] + 12, tableTop + 8, { width: colWidths[3] });
+
+        let currentY = tableTop + 28;
+        subjects.forEach((subject, index) => {
+            const rowColor = index % 2 === 0 ? "#f8fafc" : "#ffffff";
+            doc.fillColor(rowColor).rect(tableLeft, currentY, tableWidth, rowHeight).fill();
+
+            const observation = subject.note >= 16 ? "Excellent" : subject.note >= 14 ? "Très bien" : subject.note >= 12 ? "Bien" : subject.note >= 10 ? "Assez bien" : "À améliorer";
+            doc.fillColor(textDark).font("Helvetica").fontSize(10);
+            doc.text(subject.nom_matiere, tableLeft + 12, currentY + 6, { width: colWidths[0] });
+            doc.text(subject.note?.toString() ?? "N/A", tableLeft + colWidths[0] + 12, currentY + 6, { width: colWidths[1] });
+            doc.text(subject.coef?.toString() ?? "N/A", tableLeft + colWidths[0] + colWidths[1] + 12, currentY + 6, { width: colWidths[2] });
+            doc.text(observation, tableLeft + colWidths[0] + colWidths[1] + colWidths[2] + 12, currentY + 6, { width: colWidths[3] });
+
+            doc.strokeColor(softGrey).lineWidth(0.5).moveTo(tableLeft, currentY + rowHeight).lineTo(tableLeft + tableWidth, currentY + rowHeight).stroke();
+            currentY += rowHeight;
+        });
+
+        // Résultat final
+        const resultTop = currentY + 30;
+        const resultHeight = 100;
+        doc.roundedRect(tableLeft, resultTop, tableWidth, resultHeight, 12).fill(lightGrey).stroke();
+
+        const badgeColor = mention === "Très Bien" ? accentGreen : mention === "Bien" ? accentBlue : mention === "Assez Bien" ? accentOrange : accentRed;
+        doc.fillColor(textDark).font("Helvetica-Bold").fontSize(12).text("Résultat final", tableLeft + 18, resultTop + 18);
+        doc.font("Helvetica-Bold").fontSize(36).fillColor(nightBlue).text(`${average.toFixed(2)}`, tableLeft + 18, resultTop + 42);
+        doc.font("Helvetica-Bold").fontSize(14).fillColor(badgeColor).text(mention, tableLeft + 140, resultTop + 72, { align: "left" });
+
+        // Footer
+        const footerY = doc.page.height - 80;
+        doc.strokeColor(softGrey).lineWidth(0.5).moveTo(50, footerY).lineTo(doc.page.width - 50, footerY).stroke();
+        doc.font("Helvetica").fontSize(9).fillColor(textDark).text("Document généré automatiquement par UNILIFE", 50, footerY + 12);
+        doc.text("Signature administration de l'école", 50, footerY + 26);
+        doc.text(`Page 1 / 1`, doc.page.width - 110, footerY + 12, { align: "right", width: 60 });
+
+        doc.end();
     } catch (err) {
-        res.status(500).json({ success: false, message: "Erreur serveur" });
+        console.error(err);
+        res.status(500).json({ success: false, message: "Erreur PDF" });
     }
 });
 
-/* =========================
-   DELETE STUDENT
-========================= */
-app.delete("/student/:id", authMiddleware, async (req, res) => {
-    try {
-        const userId = getUserId(req);
-
-        await supabase
-            .from("subjects")
-            .delete()
-            .eq("student_id", req.params.id)
-            .eq("user_id", userId);
-
-        const { error } = await supabase
-            .from("students")
-            .delete()
-            .eq("id", req.params.id)
-            .eq("user_id", userId);
-
-        if (error) throw error;
-
-        res.json({ success: true, message: "Étudiant supprimé" });
-    } catch (err) {
-        res.status(500).json({ success: false, message: "Erreur serveur" });
-    }
-});
-
-/* =========================
-   LANCEMENT SERVEUR
-========================= */
+// ====================== START SERVER ======================
 const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => {
-    console.log(`✅ UNILIFE SERVER RUNNING ON PORT ${PORT}`);
+    console.log(`🚀 UNILIFE Backend running on http://localhost:${PORT}`);
+    console.log(`📱 Accès à l'application : http://localhost:${PORT}/app/`);
 });
